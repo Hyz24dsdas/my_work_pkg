@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -rn \"strcpy_arr\\\\|strcpy_arr\" /home/kmd/.mujoco/mujoco-3.10.0/include/ 2>/dev/null | head -10)",
+      "Read(//home/kmd/.mujoco/mujoco-3.10.0/include/**)"
+    ]
+  }
+}
