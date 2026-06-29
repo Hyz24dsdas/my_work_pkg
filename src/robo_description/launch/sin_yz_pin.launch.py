@@ -1,20 +1,27 @@
 """
-Launch file for L-shape dual-arm robot with figure-8 left-gripper trajectory.
+Launch file for sin_yz_pin — left-arm figure-8 in the yz plane.
 
-MuJoCo animation + Pinocchio kinematics/dynamics + impedance control.
+The controller uses hierarchical inverse dynamics: left tool x first, left y/z
+figure-8 second, right end-effector hold third, then joint posture in the
+remaining null-space. MuJoCo and Pinocchio both load the same MJCF model;
+Pinocchio computes inverse dynamics with RNEA.
 
 Topics published (subscribe in PlotJuggler):
-  /sin_control_node/left_ee_actual    — actual left EE pose
-  /sin_control_node/left_ee_desired   — desired left EE pose (figure-8)
-  /sin_control_node/right_ee_actual   — actual right EE pose
-  /sin_control_node/right_ee_desired  — desired right EE pose (static L-shape)
-  /joint_states                        — all joint positions/velocities
+  /sin_yz_pin_node/left_ee_actual        — actual left EE pose
+  /sin_yz_pin_node/left_ee_desired       — desired left EE pose (figure-8)
+  /sin_yz_pin_node/right_ee_actual       — actual right EE pose
+  /sin_yz_pin_node/right_ee_desired      — desired right EE pose (static L-shape)
+  /joint_states                          — actual joint positions/velocities
+  /sin_yz_pin_node/joint_actual          — actual joint positions/velocities
+  /sin_yz_pin_node/joint_desired         — desired joint positions/velocities
+  /sin_yz_pin_node/joint_actual_kinematics   — [q, qd, qdd] per joint
+  /sin_yz_pin_node/joint_desired_kinematics  — [q_des, qd_des, qdd_des] per joint
 
 Override parameters at runtime:
-  ros2 launch robo_description sin_control.launch.py \
-      Kp_z:=1500.0 Kd_z:=300.0 \
-      Kq_posture:=100.0 Dq_posture:=20.0 \
-      figure8_frequency:=0.5 figure8_amplitude_x:=0.2
+  ros2 launch robo_description sin_yz_pin.launch.py \
+      Kp_x:=2500.0 Kd_x:=350.0 Kp_y:=900.0 Kd_y:=180.0 Kp_z:=1200.0 Kd_z:=240.0 \
+      Kq_posture:=300.0 Dq_posture:=45.0 \
+      figure8_frequency:=0.25 figure8_amplitude_x:=0.08 figure8_amplitude_z:=0.06
 """
 import os
 
@@ -36,7 +43,7 @@ def generate_launch_description():
     urdf_path_arg = DeclareLaunchArgument(
         "urdf_path",
         default_value="/home/kmd/Marvin_Description-Robot_Description/urdf/marvin_pro/marvin_robot.urdf",
-        description="Path to the URDF model file"
+        description="Optional URDF file used only to publish robot_description"
     )
     mjcf_path_arg = DeclareLaunchArgument(
         "mjcf_path",
@@ -44,25 +51,25 @@ def generate_launch_description():
         description="Path to the MuJoCo MJCF model file"
     )
 
-    # ---- Task-space impedance gains (per-axis: Kz ≫ Kx so height-keeping dominates) ----
+    # ---- Task-space impedance gains ----
     Kp_x_arg = DeclareLaunchArgument(
-        "Kp_x", default_value="300.0",
+        "Kp_x", default_value="2500.0",
         description="Task-space stiffness gain — X axis"
     )
     Kp_y_arg = DeclareLaunchArgument(
-        "Kp_y", default_value="100.0",
+        "Kp_y", default_value="900.0",
         description="Task-space stiffness gain — Y axis"
     )
     Kp_z_arg = DeclareLaunchArgument(
         "Kp_z", default_value="1200.0",
-        description="Task-space stiffness gain — Z axis (height priority)"
+        description="Task-space stiffness gain — Z axis"
     )
     Kd_x_arg = DeclareLaunchArgument(
-        "Kd_x", default_value="80.0",
+        "Kd_x", default_value="350.0",
         description="Task-space damping gain — X axis"
     )
     Kd_y_arg = DeclareLaunchArgument(
-        "Kd_y", default_value="30.0",
+        "Kd_y", default_value="180.0",
         description="Task-space damping gain — Y axis"
     )
     Kd_z_arg = DeclareLaunchArgument(
@@ -72,11 +79,11 @@ def generate_launch_description():
 
     # ---- Joint posture PD gains ----
     Kq_posture_arg = DeclareLaunchArgument(
-        "Kq_posture", default_value="150.0",
+        "Kq_posture", default_value="300.0",
         description="Posture stiffness gain (joint-space PD)"
     )
     Dq_posture_arg = DeclareLaunchArgument(
-        "Dq_posture", default_value="25.0",
+        "Dq_posture", default_value="45.0",
         description="Posture damping gain (joint-space PD)"
     )
 
@@ -88,27 +95,27 @@ def generate_launch_description():
 
     # ---- Figure-8 trajectory parameters ----
     fig8_freq_arg = DeclareLaunchArgument(
-        "figure8_frequency", default_value="0.5",
+        "figure8_frequency", default_value="1.00",
         description="Figure-8 frequency (Hz) — one full cycle per 1/freq seconds"
     )
     fig8_amp_x_arg = DeclareLaunchArgument(
-        "figure8_amplitude_x", default_value="0.15",
-        description="Figure-8 amplitude in the first axis (m)"
+        "figure8_amplitude_x", default_value="0.08",
+        description="Figure-8 amplitude in the first trajectory axis (Y for yz, m)"
     )
     fig8_amp_z_arg = DeclareLaunchArgument(
-        "figure8_amplitude_z", default_value="0.10",
+        "figure8_amplitude_z", default_value="0.06",
         description="Figure-8 amplitude in the second axis (m)"
     )
     fig8_plane_arg = DeclareLaunchArgument(
-        "figure8_plane", default_value="xz",
+        "figure8_plane", default_value="yz",
         description="Plane of the figure-8: 'xz', 'yz', or 'xy'"
     )
 
     # ---- Node ----
-    sin_control_node = Node(
+    sin_yz_pin_node = Node(
         package="robo_description",
-        executable="sin_control",
-        name="sin_control_node",
+        executable="sin_yz_pin",
+        name="sin_yz_pin_node",
         output="screen",
         parameters=[{
             "urdf_path":           LaunchConfiguration("urdf_path"),
@@ -146,5 +153,5 @@ def generate_launch_description():
         fig8_amp_x_arg,
         fig8_amp_z_arg,
         fig8_plane_arg,
-        sin_control_node,
+        sin_yz_pin_node,
     ])

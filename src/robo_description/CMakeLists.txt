@@ -66,90 +66,195 @@ target_link_libraries(robo_des
 )
 
 # executable: impedance-controlled simulator (bypassed MuJoCo physics)
-add_executable(impedance_control_node src/impedance_control_node.cpp)
-target_include_directories(impedance_control_node PRIVATE
-  ${MUJOCO_INCLUDE_DIR}
-  ${GLFW3_INCLUDE_DIRS}
-  ${PINOCCHIO_INC}
-  ${EIGEN3_INCLUDE_DIRS}
-)
-ament_target_dependencies(impedance_control_node
-  rclcpp
-  sensor_msgs
-  std_msgs
-  tf2_ros
-)
-target_link_libraries(impedance_control_node
-  pinocchio::pinocchio
-  ${MUJOCO_LIBRARY}
-  ${GLFW3_LIBRARIES}
-)
+# add_executable(impedance_control_node src/impedance_control_node.cpp)
+if(TARGET impedance_control_node)
+  target_include_directories(impedance_control_node PRIVATE
+    ${MUJOCO_INCLUDE_DIR}
+    ${GLFW3_INCLUDE_DIRS}
+    ${PINOCCHIO_INC}
+    ${EIGEN3_INCLUDE_DIRS}
+  )
+  ament_target_dependencies(impedance_control_node
+    rclcpp
+    sensor_msgs
+    std_msgs
+    tf2_ros
+  )
+  target_link_libraries(impedance_control_node
+    pinocchio::pinocchio
+    ${MUJOCO_LIBRARY}
+    ${GLFW3_LIBRARIES}
+  )
+endif()
 
 # executable: L-shape + figure-8 trajectory + impedance control (full MuJoCo UI)
-add_executable(sin_control
-  src/sin_control.cpp
+# add_executable(sin_control
+#   src/sin_control.cpp
+#   simulate_mujoco/simulate.cc
+#   simulate_mujoco/glfw_adapter.cc
+#   simulate_mujoco/glfw_dispatch.cc
+#   simulate_mujoco/platform_ui_adapter.cc
+#   simulate_mujoco/lodepng.cpp
+# )
+if(TARGET sin_control)
+  target_include_directories(sin_control PRIVATE
+    ${MUJOCO_INCLUDE_DIR}
+    ${GLFW3_INCLUDE_DIRS}
+    ${PINOCCHIO_INC}
+    ${EIGEN3_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/simulate_mujoco
+  )
+  ament_target_dependencies(sin_control
+    rclcpp
+    sensor_msgs
+    std_msgs
+    tf2_ros
+    geometry_msgs
+  )
+  target_link_libraries(sin_control
+    pinocchio::pinocchio
+    ${MUJOCO_LIBRARY}
+    ${GLFW3_LIBRARIES}
+  )
+endif()
+
+# executable: sin_xz_control — flat task-space control (no z-priority hierarchy)
+add_executable(sin_xz_control
+  src/sin_xz_control.cpp
   simulate_mujoco/simulate.cc
   simulate_mujoco/glfw_adapter.cc
   simulate_mujoco/glfw_dispatch.cc
   simulate_mujoco/platform_ui_adapter.cc
   simulate_mujoco/lodepng.cpp
 )
-target_include_directories(sin_control PRIVATE
+target_include_directories(sin_xz_control PRIVATE
   ${MUJOCO_INCLUDE_DIR}
   ${GLFW3_INCLUDE_DIRS}
   ${PINOCCHIO_INC}
   ${EIGEN3_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}/simulate_mujoco
 )
-ament_target_dependencies(sin_control
+ament_target_dependencies(sin_xz_control
   rclcpp
   sensor_msgs
   std_msgs
   tf2_ros
   geometry_msgs
 )
-target_link_libraries(sin_control
+target_link_libraries(sin_xz_control
   pinocchio::pinocchio
   ${MUJOCO_LIBRARY}
   ${GLFW3_LIBRARIES}
 )
 
-# install
-install(TARGETS robo_des impedance_control_node sin_control
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-# executable: MuJoCo simulate UI + impedance controller
-add_executable(impedance_simulate
-  src/impedance_simulate_main.cpp
+# executable: sin_yz_control — separate yz-plane figure-8 controller
+add_executable(sin_yz_control
+  src/sin_yz_control.cpp
   simulate_mujoco/simulate.cc
   simulate_mujoco/glfw_adapter.cc
   simulate_mujoco/glfw_dispatch.cc
   simulate_mujoco/platform_ui_adapter.cc
   simulate_mujoco/lodepng.cpp
 )
-target_include_directories(impedance_simulate PRIVATE
+target_include_directories(sin_yz_control PRIVATE
   ${MUJOCO_INCLUDE_DIR}
   ${GLFW3_INCLUDE_DIRS}
   ${PINOCCHIO_INC}
   ${EIGEN3_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}/simulate_mujoco
 )
-ament_target_dependencies(impedance_simulate
+ament_target_dependencies(sin_yz_control
   rclcpp
   sensor_msgs
   std_msgs
   tf2_ros
+  geometry_msgs
 )
-target_link_libraries(impedance_simulate
+target_link_libraries(sin_yz_control
   pinocchio::pinocchio
   ${MUJOCO_LIBRARY}
   ${GLFW3_LIBRARIES}
 )
 
-install(TARGETS impedance_simulate
+# executable: sin_yz_pin — yz-plane controller with Pinocchio inverse dynamics
+add_executable(sin_yz_pin
+  src/sin_yz_pin.cpp
+  simulate_mujoco/simulate.cc
+  simulate_mujoco/glfw_adapter.cc
+  simulate_mujoco/glfw_dispatch.cc
+  simulate_mujoco/platform_ui_adapter.cc
+  simulate_mujoco/lodepng.cpp
+)
+target_include_directories(sin_yz_pin PRIVATE
+  ${MUJOCO_INCLUDE_DIR}
+  ${GLFW3_INCLUDE_DIRS}
+  ${PINOCCHIO_INC}
+  ${EIGEN3_INCLUDE_DIRS}
+  ${CMAKE_CURRENT_SOURCE_DIR}/simulate_mujoco
+)
+ament_target_dependencies(sin_yz_pin
+  rclcpp
+  sensor_msgs
+  std_msgs
+  tf2_ros
+  geometry_msgs
+)
+target_link_libraries(sin_yz_pin
+  pinocchio::pinocchio
+  ${MUJOCO_LIBRARY}
+  ${GLFW3_LIBRARIES}
+)
+
+# install
+set(ROBO_DESCRIPTION_INSTALL_TARGETS
+  robo_des
+  sin_xz_control
+  sin_yz_control
+  sin_yz_pin
+)
+if(TARGET impedance_control_node)
+  list(APPEND ROBO_DESCRIPTION_INSTALL_TARGETS impedance_control_node)
+endif()
+if(TARGET sin_control)
+  list(APPEND ROBO_DESCRIPTION_INSTALL_TARGETS sin_control)
+endif()
+install(TARGETS ${ROBO_DESCRIPTION_INSTALL_TARGETS}
   DESTINATION lib/${PROJECT_NAME}
 )
+
+# executable: MuJoCo simulate UI + impedance controller
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/impedance_simulate_main.cpp")
+  add_executable(impedance_simulate
+    src/impedance_simulate_main.cpp
+    simulate_mujoco/simulate.cc
+    simulate_mujoco/glfw_adapter.cc
+    simulate_mujoco/glfw_dispatch.cc
+    simulate_mujoco/platform_ui_adapter.cc
+    simulate_mujoco/lodepng.cpp
+  )
+  target_include_directories(impedance_simulate PRIVATE
+    ${MUJOCO_INCLUDE_DIR}
+    ${GLFW3_INCLUDE_DIRS}
+    ${PINOCCHIO_INC}
+    ${EIGEN3_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/simulate_mujoco
+  )
+  ament_target_dependencies(impedance_simulate
+    rclcpp
+    sensor_msgs
+    std_msgs
+    tf2_ros
+  )
+  target_link_libraries(impedance_simulate
+    pinocchio::pinocchio
+    ${MUJOCO_LIBRARY}
+    ${GLFW3_LIBRARIES}
+  )
+
+  install(TARGETS impedance_simulate
+    DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
 install(DIRECTORY model/
   DESTINATION share/${PROJECT_NAME}/model
 )
