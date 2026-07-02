@@ -1,22 +1,23 @@
-// yz平面8字轨迹速度控制 + 记录/回放
-// MuJoCo负责仿真和可视化，marvin_v.xml中的actuator为velocity servo
+// yz平面8字轨迹MIT控制 + 记录/回放
+// MuJoCo负责仿真和可视化，控制输出为MIT接口五元组(q_des, qd_des, kp, kd, tau_ff)
 
 //Copyright 2024
 //
 // L-shape dual-arm robot with figure-8 left-gripper trajectory.
 // - Full MuJoCo 3.x UI (panels, sliders, double-click perturbation, keyframes, history)
 // - Pinocchio: FK and Jacobian
-// - Hierarchical task-space velocity control
+// - Hierarchical task-space velocity target + MIT joint command
 // - ROS2: joint_states, TF, EE pose topics for PlotJuggler
 //
 // Architecture:
 //   Main thread:  MuJoCo UI (Simulate::RenderLoop) + ROS2 publishing
-//   Physics thread: Pinocchio kinematics + velocity controller + mj_step
+//   Physics thread: Pinocchio kinematics + MIT controller + mj_step
 //
 // Control law:
 //   first cycle: hierarchical damped least-squares velocity tasks
 //     J(q) qdot_cmd = xdot_ref + Kp * (x_ref - x)
-//   replay cycles: qdot_cmd = qdot_des + Kp * (q_des - q) + Kd * (qdot_des - qdot)
+//   MIT command:
+//     tau = kp * (q_des - q) + kd * (qd_des - qd) + tau_ff, tau_ff = 0
 //
 // Target: arms form L-shape (upper arm horizontal, forearm down).
 //         Left gripper traces a figure-8 (∞) in a plane.
@@ -28,8 +29,11 @@ ros2 launch robo_description replay_yz_pin_v.launch.py \
   Kp_y:=8.0 \
   Kp_z:=8.0 \
   Kq_posture:=2.0 \
-  replay_Kp:=4.0 \
-  replay_Kd:=0.5 \
+  replay_Kp:=8.0 \
+  replay_Kd:=1.0 \
+  mit_Kp:=220.0 \
+  mit_Kd:=20.0 \
+  max_desired_qdd:=12.0 \
   figure8_frequency:=0.25 \
   figure8_amplitude_x:=0.08 \
   figure8_amplitude_z:=0.06
@@ -80,6 +84,7 @@ public:
                       const Eigen::Vector3d& Kp_task,
                       double Kq_posture,
                       double replay_Kp, double replay_Kd,
+                      double mit_Kp, double mit_Kd,
                       double max_desired_qdd,
                       const std::string& left_ee_name,
                       const std::string& right_ee_name,
@@ -88,6 +93,7 @@ public:
     : Kp_task_(Kp_task)
     , Kq_posture_(Kq_posture)
     , replay_Kp_(replay_Kp), replay_Kd_(replay_Kd)
+    , mit_Kp_(mit_Kp), mit_Kd_(mit_Kd)
     , max_desired_qdd_(max_desired_qdd)
     , fig8_freq_(fig8_freq)
     , fig8_amp_x_(fig8_amp_x)
@@ -113,6 +119,7 @@ public:
     printf("Left  upper frame: 'Arm_L3_Link' id=%d\n", left_upper_frame_id_);
     printf("Left  forearm frame: 'Arm_L5_Link' id=%d\n", left_forearm_frame_id_);
     printf("Replay joint velocity tracking: Kp=%.2f Kd=%.2f\n", replay_Kp_, replay_Kd_);
+    printf("MIT gains: Kp=%.2f Kd=%.2f tau_ff=0.00\n", mit_Kp_, mit_Kd_);
   }
 
   // Must be called AFTER mjModel is loaded
@@ -129,7 +136,7 @@ public:
            pin_joint_names_.size(), (long)m->nu);
   }
 
-  // One control step: read state, compute kinematics, write velocity commands.
+  // One control step: read state, compute kinematics, write MIT commands.
   void control_step(mjData* d)
   {
     if (!mj_model_) return;
@@ -299,9 +306,18 @@ public:
 
       qd_cmd += N * qd_posture;
 
-      record_actual_joint_sample(t, q, qd);
+      record_desired_joint_sample(t);
 
-      apply_joint_velocities_to_mujoco(d, qd_cmd);
+      Eigen::VectorXd q_des = q;
+      for (size_t i = 0; i < pin_joint_names_.size(); ++i) {
+        const int pin_q = pin_q_idx_[i];
+        const int pin_v = pin_v_idx_[i];
+        if (pin_q >= 0 && pin_q < q_des.size() &&
+            pin_v >= 0 && pin_v < qd_cmd.size()) {
+          q_des[pin_q] += qd_cmd[pin_v] * std::max(dt_, 1e-6);
+        }
+      }
+      apply_mit_commands_to_mujoco(d, q, qd, q_des, qd_cmd);
 
       last_qd_cmd_ = qd_cmd;
       last_q_ = q;
@@ -321,12 +337,16 @@ public:
   const Eigen::VectorXd& desired_qd() const { return desired_qd_; }
   const Eigen::VectorXd& desired_qdd() const { return desired_qdd_; }
   const Eigen::VectorXd& last_qd_cmd() const { return last_qd_cmd_; }
+  const Eigen::VectorXd& last_mit_q_des() const { return last_mit_q_des_; }
+  const Eigen::VectorXd& last_mit_qd_des() const { return last_mit_qd_des_; }
+  const Eigen::VectorXd& last_mit_kp() const { return last_mit_kp_; }
+  const Eigen::VectorXd& last_mit_kd() const { return last_mit_kd_; }
+  const Eigen::VectorXd& last_mit_tau_ff() const { return last_mit_tau_ff_; }
   const std::vector<std::string>& joint_names() const { return pin_joint_names_; }
   const std::vector<int>& pin_q_idx() const { return pin_q_idx_; }
   const std::vector<int>& pin_v_idx() const { return pin_v_idx_; }
   const std::vector<int>& mj_qpos_adr() const { return mj_qpos_adr_; }
   const std::vector<int>& mj_dof_adr()  const { return mj_dof_adr_; }
-  const std::vector<int>& mj_actuator_of_pin_v() const { return mj_actuator_of_pin_v_; }
 
   const pinocchio::Model& pin_model() const { return pin_model_; }
   const pinocchio::Data&  pin_data()  const { return *pin_data_; }
@@ -535,16 +555,52 @@ private:
     return q;
   }
 
-  void apply_joint_velocities_to_mujoco(mjData* d, const Eigen::VectorXd& qd_cmd)
+  void apply_mit_commands_to_mujoco(mjData* d,
+                                    const Eigen::VectorXd& q,
+                                    const Eigen::VectorXd& qd,
+                                    const Eigen::VectorXd& q_des,
+                                    const Eigen::VectorXd& qd_des)
   {
     std::fill(d->ctrl, d->ctrl + mj_model_->nu, 0.0);
+    last_mit_q_des_ = q_des;
+    last_mit_qd_des_ = qd_des;
+    last_mit_kp_ = Eigen::VectorXd::Zero(pin_model_.nv);
+    last_mit_kd_ = Eigen::VectorXd::Zero(pin_model_.nv);
+    last_mit_tau_ff_ = Eigen::VectorXd::Zero(pin_model_.nv);
 
     for (int i = 0; i < pin_model_.nv; ++i) {
       int act_id = mj_actuator_of_pin_v_[i];
       if (act_id < 0) continue;
       if (i >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[i]) continue;
 
-      double cmd = qd_cmd[i];
+      int pin_q = -1;
+      std::string joint_name;
+      for (size_t j = 0; j < pin_v_idx_.size(); ++j) {
+        if (pin_v_idx_[j] == i) {
+          pin_q = pin_q_idx_[j];
+          joint_name = pin_joint_names_[j];
+          break;
+        }
+      }
+      if (pin_q < 0 || pin_q >= q.size() || pin_q >= q_des.size() ||
+          i >= qd.size() || i >= qd_des.size()) {
+        continue;
+      }
+
+      last_mit_kp_[i] = mit_Kp_;
+      last_mit_kd_[i] = mit_Kd_;
+      const double tau_ff = 0.0;
+      const bool right_arm = joint_name.find("Arm_R") == 0;
+      const double q_target =
+          (right_arm && q_rest_.size() == pin_model_.nq) ? q_rest_[pin_q] : q_des[pin_q];
+      const double qd_target = right_arm ? 0.0 : qd_des[i];
+      last_mit_q_des_[pin_q] = q_target;
+      last_mit_qd_des_[i] = qd_target;
+
+      const double raw_cmd = mit_Kp_ * (q_target - q[pin_q])
+                           + mit_Kd_ * (qd_target - qd[i])
+                           + tau_ff;
+      double cmd = raw_cmd;
 
       // MuJoCo actuator ctrlrange
       double lo = mj_model_->actuator_ctrlrange[2 * act_id + 0];
@@ -562,8 +618,8 @@ private:
 
       if (saturated && should_log_saturation(act_id, d->time)) {
         const char* act_name = mj_id2name(mj_model_, mjOBJ_ACTUATOR, act_id);
-        printf("[SAT] actuator=%s qd_cmd=%.2f clipped to [%.2f, %.2f]\n",
-               act_name ? act_name : "unknown", qd_cmd[i], lo, hi);
+        printf("[SAT] actuator=%s mit_tau=%.2f clipped to [%.2f, %.2f]\n",
+               act_name ? act_name : "unknown", raw_cmd, lo, hi);
       }
 
       d->ctrl[act_id] = cmd;
@@ -586,21 +642,21 @@ private:
     double alpha = 0.0;
   };
 
-  void record_actual_joint_sample(double t,
-                                  const Eigen::VectorXd& q,
-                                  const Eigen::VectorXd& qd)
+  void record_desired_joint_sample(double t)
   {
+    if (desired_q_.size() != pin_model_.nq ||
+        desired_qd_.size() != pin_model_.nv) {
+      return;
+    }
+
     JointSample sample;
     sample.t = std::max(0.0, t);
-    sample.q = q;
-    sample.qd = qd;
-    sample.qdd = Eigen::VectorXd::Zero(pin_model_.nv);
-
-    if (!recorded_trajectory_.empty()) {
-      const JointSample& prev = recorded_trajectory_.back();
-      const double dt = std::max(sample.t - prev.t, 1e-6);
-      sample.qdd = (sample.qd - prev.qd) / dt;
-      recorded_trajectory_.back().qdd = sample.qdd;
+    sample.q = desired_q_;
+    sample.qd = desired_qd_;
+    if (desired_qdd_.size() == pin_model_.nv) {
+      sample.qdd = desired_qdd_;
+    } else {
+      sample.qdd = Eigen::VectorXd::Zero(pin_model_.nv);
     }
 
     recorded_trajectory_.push_back(sample);
@@ -611,16 +667,13 @@ private:
     const size_t n = recorded_trajectory_.size();
     if (n < 3) return;
 
-    const double period = std::max(replay_cycle_duration_, 1e-6);
     for (size_t i = 0; i < n; ++i) {
       recorded_trajectory_[i].qd = Eigen::VectorXd::Zero(pin_model_.nv);
       recorded_trajectory_[i].qdd = Eigen::VectorXd::Zero(pin_model_.nv);
     }
 
     auto segment_dt = [&](size_t lo, size_t hi) {
-      double dt = recorded_trajectory_[hi].t - recorded_trajectory_[lo].t;
-      if (dt <= 0.0) dt += period;
-      return std::max(dt, 1e-6);
+      return std::max(recorded_trajectory_[hi].t - recorded_trajectory_[lo].t, 1e-6);
     };
 
     auto pchip_slope = [](double d_prev, double d_next,
@@ -643,26 +696,21 @@ private:
         continue;
       }
 
-      for (size_t i = 0; i < n - 1; ++i) {
-        const size_t prev = (i == 0) ? n - 2 : i - 1;
-        const size_t next = i + 1;
-        const double h_prev = (i == 0)
-            ? std::max(period - recorded_trajectory_[prev].t, 1e-6)
-            : segment_dt(prev, i);
-        const double h_next = segment_dt(i, next);
-        const double d_prev =
-            (recorded_trajectory_[i].q[pin_q] -
-             recorded_trajectory_[prev].q[pin_q]) / h_prev;
-        const double d_next =
-            (recorded_trajectory_[next].q[pin_q] -
-             recorded_trajectory_[i].q[pin_q]) / h_next;
-
-        recorded_trajectory_[i].qd[pin_v] =
-            pchip_slope(d_prev, d_next, h_prev, h_next);
+      std::vector<double> h(n - 1, 1e-6);
+      std::vector<double> d(n - 1, 0.0);
+      for (size_t i = 0; i + 1 < n; ++i) {
+        h[i] = segment_dt(i, i + 1);
+        d[i] = (recorded_trajectory_[i + 1].q[pin_q] -
+                recorded_trajectory_[i].q[pin_q]) / h[i];
       }
-    }
 
-    recorded_trajectory_.back().qd = recorded_trajectory_.front().qd;
+      recorded_trajectory_.front().qd[pin_v] = d.front();
+      for (size_t i = 1; i + 1 < n; ++i) {
+        recorded_trajectory_[i].qd[pin_v] =
+            pchip_slope(d[i - 1], d[i], h[i - 1], h[i]);
+      }
+      recorded_trajectory_.back().qd[pin_v] = recorded_trajectory_.front().qd[pin_v];
+    }
   }
 
   void finish_recording(double cycle_duration)
@@ -670,7 +718,41 @@ private:
     replay_cycle_duration_ = cycle_duration;
     recorded_trajectory_.front().t = 0.0;
     recorded_trajectory_.back().t = replay_cycle_duration_;
-    recorded_trajectory_.back().q = recorded_trajectory_.front().q;
+
+    double max_closure_drift = 0.0;
+    for (size_t j = 0; j < pin_joint_names_.size(); ++j) {
+      const int pin_q = pin_q_idx_[j];
+      const int pin_v = pin_v_idx_[j];
+      if (pin_q < 0 || pin_q >= pin_model_.nq ||
+          pin_v < 0 || pin_v >= pin_model_.nv ||
+          pin_v >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[pin_v]) {
+        continue;
+      }
+
+      const double drift =
+          recorded_trajectory_.back().q[pin_q] - recorded_trajectory_.front().q[pin_q];
+      max_closure_drift = std::max(max_closure_drift, std::abs(drift));
+    }
+
+    constexpr double kClosureSnapThreshold = 0.01;  // rad
+    if (max_closure_drift <= kClosureSnapThreshold) {
+      for (size_t j = 0; j < pin_joint_names_.size(); ++j) {
+        const int pin_q = pin_q_idx_[j];
+        const int pin_v = pin_v_idx_[j];
+        if (pin_q < 0 || pin_q >= pin_model_.nq ||
+            pin_v < 0 || pin_v >= pin_model_.nv ||
+            pin_v >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[pin_v]) {
+          continue;
+        }
+        recorded_trajectory_.back().q[pin_q] = recorded_trajectory_.front().q[pin_q];
+      }
+      printf("[REPLAY] Snapped small cycle closure drift: max=%.6f rad\n",
+             max_closure_drift);
+    } else {
+      printf("[REPLAY] Cycle closure drift is %.6f rad; keeping planned shape without linear drift removal.\n",
+             max_closure_drift);
+    }
+
     rebuild_recorded_trajectory_derivatives();
 
     recording_complete_ = true;
@@ -679,9 +761,9 @@ private:
     replay_cycle_index_ = 1;
     reset_replay_metrics();
 
-    printf("[REPLAY] Recorded first real joint trajectory: samples=%zu duration=%.3f s\n",
+    printf("[REPLAY] Recorded first desired joint trajectory: samples=%zu duration=%.3f s\n",
            recorded_trajectory_.size(), replay_cycle_duration_);
-    printf("[REPLAY] From cycle 2 onward, using C1 shape-preserving recorded joints as desired and tracking with joint velocity commands.\n");
+    printf("[REPLAY] From cycle 2 onward, using C1 shape-preserving planned joints as desired and tracking with MIT commands.\n");
   }
 
   ReplayReference sample_replay_reference(double t_in_cycle) const
@@ -913,7 +995,7 @@ private:
                      + replay_Kd_ * (desired_qd_[pin_v] - qd[pin_v]);
     }
 
-    apply_joint_velocities_to_mujoco(d, qd_cmd);
+    apply_mit_commands_to_mujoco(d, q, qd, desired_q_, qd_cmd);
 
     last_qd_cmd_ = qd_cmd;
     last_q_ = q;
@@ -1076,9 +1158,11 @@ private:
   Eigen::Vector3d Kp_task_;
   double dt_ = 0.001;
   double Kq_posture_;
-  double replay_Kp_ = 4.0;
-  double replay_Kd_ = 0.5;
-  double max_desired_qdd_ = 6.0;
+  double replay_Kp_ = 8.0;
+  double replay_Kd_ = 1.0;
+  double mit_Kp_ = 220.0;
+  double mit_Kd_ = 20.0;
+  double max_desired_qdd_ = 12.0;
 
   // Figure-8
   double fig8_freq_, fig8_amp_x_, fig8_amp_z_;
@@ -1094,6 +1178,7 @@ private:
 
   // Last state
   Eigen::VectorXd last_q_, last_qd_, last_qdd_, last_qd_cmd_;
+  Eigen::VectorXd last_mit_q_des_, last_mit_qd_des_, last_mit_kp_, last_mit_kd_, last_mit_tau_ff_;
   Eigen::VectorXd desired_q_, desired_qd_, desired_qdd_;
 
   // Recorded real joint trajectory and replay metrics
@@ -1123,7 +1208,7 @@ static std::shared_ptr<rclcpp::Node> g_ros_node;
 static rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr g_joint_pub;
 static rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr g_joint_actual_pub;
 static rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr g_joint_desired_pub;
-static rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr g_left_joint_velocity_cmd_pub;
+static rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr g_left_joint_mit_cmd_pub;
 static rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr g_joint_actual_kinematics_pub;
 static rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr g_joint_desired_kinematics_pub;
 static std::unique_ptr<tf2_ros::TransformBroadcaster> g_tf_broadcaster;
@@ -1342,7 +1427,6 @@ static void publish_ros2(mj::Simulate& /*sim*/)
   const auto& qpos_adr    = g_ctrl->mj_qpos_adr();
   const auto& dof_adr     = g_ctrl->mj_dof_adr();
   const auto& pin_v_idx    = g_ctrl->pin_v_idx();
-  const auto& actuator_of_pin_v = g_ctrl->mj_actuator_of_pin_v();
   size_t n = joint_names.size();
   const auto stamp = g_ros_node->get_clock()->now();
 
@@ -1362,27 +1446,47 @@ static void publish_ros2(mj::Simulate& /*sim*/)
     g_joint_actual_pub->publish(msg);
   }
 
-  // Left-arm joint velocity commands for PlotJuggler. Values come from MuJoCo
-  // actuator controls after ctrlrange clipping, so they are the applied commands.
+  // Left-arm MIT commands for PlotJuggler:
+  // data = [q_des, qd_des, kp, kd, tau_ff] per left-arm joint.
   {
-    auto msg = sensor_msgs::msg::JointState();
-    msg.header.stamp = stamp;
+    auto msg = std_msgs::msg::Float64MultiArray();
+    msg.layout.dim.resize(2);
+    msg.layout.dim[0].label = "left_joint";
+    msg.layout.dim[0].stride = 7 * 5;
+    msg.layout.dim[1].label = "q_qd_kp_kd_tau_ff";
+    msg.layout.dim[1].size = 5;
+    msg.layout.dim[1].stride = 5;
+
+    const auto& q_des = g_ctrl->last_mit_q_des();
+    const auto& qd_des = g_ctrl->last_mit_qd_des();
+    const auto& mit_kp = g_ctrl->last_mit_kp();
+    const auto& mit_kd = g_ctrl->last_mit_kd();
+    const auto& tau_ff = g_ctrl->last_mit_tau_ff();
+    const auto& pin_q_idx = g_ctrl->pin_q_idx();
+
+    size_t left_count = 0;
     for (size_t i = 0; i < n; ++i) {
       if (joint_names[i].find("Arm_L") != 0) continue;
 
+      const int pin_q = pin_q_idx[i];
       const int pin_v = pin_v_idx[i];
-      if (pin_v < 0 ||
-          pin_v >= static_cast<int>(actuator_of_pin_v.size())) {
+      if (pin_q < 0 || pin_q >= q_des.size() ||
+          pin_v < 0 || pin_v >= qd_des.size() ||
+          pin_v >= mit_kp.size() || pin_v >= mit_kd.size() ||
+          pin_v >= tau_ff.size()) {
         continue;
       }
 
-      const int act_id = actuator_of_pin_v[pin_v];
-      if (act_id < 0 || act_id >= g_m->nu) continue;
-
-      msg.name.push_back(joint_names[i]);
-      msg.velocity.push_back(g_d->ctrl[act_id]);
+      msg.data.push_back(q_des[pin_q]);
+      msg.data.push_back(qd_des[pin_v]);
+      msg.data.push_back(mit_kp[pin_v]);
+      msg.data.push_back(mit_kd[pin_v]);
+      msg.data.push_back(tau_ff[pin_v]);
+      ++left_count;
     }
-    g_left_joint_velocity_cmd_pub->publish(msg);
+    msg.layout.dim[0].size = left_count;
+    msg.layout.dim[0].stride = left_count * 5;
+    g_left_joint_mit_cmd_pub->publish(msg);
   }
 
   // Desired joint states from damped least-squares IK on the desired EE path.
@@ -1637,9 +1741,11 @@ int main(int argc, char** argv)
   g_ros_node->declare_parameter("Kp_y", 8.0);
   g_ros_node->declare_parameter("Kp_z", 8.0);
   g_ros_node->declare_parameter("Kq_posture", 2.0);
-  g_ros_node->declare_parameter("replay_Kp", 4.0);
-  g_ros_node->declare_parameter("replay_Kd", 0.5);
-  g_ros_node->declare_parameter("max_desired_qdd", 6.0);
+  g_ros_node->declare_parameter("replay_Kp", 8.0);
+  g_ros_node->declare_parameter("replay_Kd", 1.0);
+  g_ros_node->declare_parameter("mit_Kp", 220.0);
+  g_ros_node->declare_parameter("mit_Kd", 20.0);
+  g_ros_node->declare_parameter("max_desired_qdd", 12.0);
 
   // Figure-8 (small, slow — first get control stable, then scale up)
   g_ros_node->declare_parameter("figure8_frequency", 0.25);
@@ -1658,6 +1764,8 @@ int main(int argc, char** argv)
   double Kq_posture = g_ros_node->get_parameter("Kq_posture").as_double();
   double replay_Kp = g_ros_node->get_parameter("replay_Kp").as_double();
   double replay_Kd = g_ros_node->get_parameter("replay_Kd").as_double();
+  double mit_Kp = g_ros_node->get_parameter("mit_Kp").as_double();
+  double mit_Kd = g_ros_node->get_parameter("mit_Kd").as_double();
   double max_desired_qdd = g_ros_node->get_parameter("max_desired_qdd").as_double();
 
   double fig8_freq   = g_ros_node->get_parameter("figure8_frequency").as_double();
@@ -1678,6 +1786,7 @@ int main(int argc, char** argv)
          Kq_posture);
   printf("Replay velocity tracking: Kp=%.2f Kd=%.2f max_desired_qdd=%.2f\n",
          replay_Kp, replay_Kd, max_desired_qdd);
+  printf("MIT command: Kp=%.2f Kd=%.2f tau_ff=0.00\n", mit_Kp, mit_Kd);
   printf("Figure-8: freq=%.2f Hz  amp_first=%.2f m  amp_second=%.2f m  plane=%s\n",
          fig8_freq, fig8_amp_x, fig8_amp_z, fig8_plane.c_str());
 
@@ -1685,6 +1794,7 @@ int main(int argc, char** argv)
   g_ctrl = std::make_unique<ImpedanceController>(
       mjcf_path, Kp_task, Kq_posture,
       replay_Kp, replay_Kd,
+      mit_Kp, mit_Kd,
       max_desired_qdd,
       "left_tool", "right_tool",
       fig8_freq, fig8_amp_x, fig8_amp_z, fig8_plane);
@@ -1696,8 +1806,8 @@ int main(int argc, char** argv)
       "~/joint_actual", rclcpp::QoS(10).reliable());
   g_joint_desired_pub = g_ros_node->create_publisher<sensor_msgs::msg::JointState>(
       "~/joint_desired", rclcpp::QoS(10).reliable());
-  g_left_joint_velocity_cmd_pub = g_ros_node->create_publisher<sensor_msgs::msg::JointState>(
-      "~/left_joint_velocity_cmd", rclcpp::QoS(10).reliable());
+  g_left_joint_mit_cmd_pub = g_ros_node->create_publisher<std_msgs::msg::Float64MultiArray>(
+      "~/left_joint_mit_cmd", rclcpp::QoS(10).reliable());
   g_joint_actual_kinematics_pub = g_ros_node->create_publisher<std_msgs::msg::Float64MultiArray>(
       "~/joint_actual_kinematics", rclcpp::QoS(10).reliable());
   g_joint_desired_kinematics_pub = g_ros_node->create_publisher<std_msgs::msg::Float64MultiArray>(

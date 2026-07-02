@@ -1,10 +1,10 @@
 """
-Launch file for replay_yz_pin_v — velocity-control yz replay.
+Launch file for replay_yz_pin_v — MIT-control yz replay.
 
 The first cycle uses hierarchical task-space velocity control and records the
 actually executed q/qd/qdd. From the second cycle onward, that recorded joint
-trajectory is tracked by sending joint velocity commands to marvin_v.xml
-velocity actuators.
+trajectory is tracked by sending MIT commands: [q_des, qd_des, kp, kd, tau_ff].
+For now tau_ff is fixed to 0.0.
 
 Topics published (subscribe in PlotJuggler):
   /replay_yz_pin_v_node/left_ee_actual        — actual left EE pose
@@ -14,7 +14,7 @@ Topics published (subscribe in PlotJuggler):
   /joint_states                          — actual joint positions/velocities
   /replay_yz_pin_v_node/joint_actual          — actual joint positions/velocities
   /replay_yz_pin_v_node/joint_desired         — desired joint positions/velocities
-  /replay_yz_pin_v_node/left_joint_velocity_cmd — applied left-arm velocity commands
+  /replay_yz_pin_v_node/left_joint_mit_cmd — left-arm MIT commands [q_des, qd_des, kp, kd, tau_ff]
   /replay_yz_pin_v_node/joint_actual_kinematics   — [q, qd, qdd] per joint
   /replay_yz_pin_v_node/joint_desired_kinematics  — [q_des, qd_des, qdd_des] per joint
 
@@ -22,8 +22,9 @@ Override parameters at runtime:
   ros2 launch robo_description replay_yz_pin_v.launch.py \
       Kp_x:=8.0 Kp_y:=8.0 Kp_z:=8.0 \
       Kq_posture:=2.0 \
-      replay_Kp:=4.0 replay_Kd:=0.5 \
-      max_desired_qdd:=6.0 \
+      replay_Kp:=8.0 replay_Kd:=1.0 \
+      mit_Kp:=220.0 mit_Kd:=20.0 \
+      max_desired_qdd:=12.0 \
       figure8_frequency:=0.25 figure8_amplitude_x:=0.08 figure8_amplitude_z:=0.06
 """
 import os
@@ -51,7 +52,7 @@ def generate_launch_description():
     mjcf_path_arg = DeclareLaunchArgument(
         "mjcf_path",
         default_value="/home/kmd/my_work_pkg/src/robo_description/model/marvin_v.xml",
-        description="Path to the MuJoCo velocity-control MJCF model file"
+        description="Path to the MuJoCo MIT-control MJCF model file"
     )
 
     # ---- Task-space velocity gains ----
@@ -73,15 +74,23 @@ def generate_launch_description():
         description="Posture velocity proportional gain"
     )
     replay_Kp_arg = DeclareLaunchArgument(
-        "replay_Kp", default_value="4.0",
+        "replay_Kp", default_value="8.0",
         description="Joint-space replay position-to-velocity gain"
     )
     replay_Kd_arg = DeclareLaunchArgument(
-        "replay_Kd", default_value="0.5",
+        "replay_Kd", default_value="1.0",
         description="Joint-space replay velocity feedback gain"
     )
+    mit_Kp_arg = DeclareLaunchArgument(
+        "mit_Kp", default_value="220.0",
+        description="MIT joint stiffness gain"
+    )
+    mit_Kd_arg = DeclareLaunchArgument(
+        "mit_Kd", default_value="20.0",
+        description="MIT joint damping gain"
+    )
     max_desired_qdd_arg = DeclareLaunchArgument(
-        "max_desired_qdd", default_value="6.0",
+        "max_desired_qdd", default_value="12.0",
         description="Slew-rate limit for published desired joint velocity (rad/s^2)"
     )
 
@@ -118,6 +127,8 @@ def generate_launch_description():
             "Kq_posture":          LaunchConfiguration("Kq_posture"),
             "replay_Kp":           LaunchConfiguration("replay_Kp"),
             "replay_Kd":           LaunchConfiguration("replay_Kd"),
+            "mit_Kp":              LaunchConfiguration("mit_Kp"),
+            "mit_Kd":              LaunchConfiguration("mit_Kd"),
             "max_desired_qdd":     LaunchConfiguration("max_desired_qdd"),
             "figure8_frequency":   LaunchConfiguration("figure8_frequency"),
             "figure8_amplitude_x": LaunchConfiguration("figure8_amplitude_x"),
@@ -136,6 +147,8 @@ def generate_launch_description():
         Kq_posture_arg,
         replay_Kp_arg,
         replay_Kd_arg,
+        mit_Kp_arg,
+        mit_Kd_arg,
         max_desired_qdd_arg,
         fig8_freq_arg,
         fig8_amp_x_arg,

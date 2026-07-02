@@ -249,23 +249,23 @@
   </worldbody>
 
   <actuator>
-    <velocity name="Arm_L1_Joint" joint="Arm_L1_Joint" kv="80" ctrlrange="-2.0 2.0"/>
-    <velocity name="Arm_L2_Joint" joint="Arm_L2_Joint" kv="80" ctrlrange="-2.0 2.0"/>
-    <velocity name="Arm_L3_Joint" joint="Arm_L3_Joint" kv="60" ctrlrange="-2.0 2.0"/>
-    <velocity name="Arm_L4_Joint" joint="Arm_L4_Joint" kv="60" ctrlrange="-2.0 2.0"/>
-    <velocity name="Arm_L5_Joint" joint="Arm_L5_Joint" kv="25" ctrlrange="-3.0 3.0"/>
-    <velocity name="Arm_L6_Joint" joint="Arm_L6_Joint" kv="25" ctrlrange="-3.0 3.0"/>
-    <velocity name="Arm_L7_Joint" joint="Arm_L7_Joint" kv="25" ctrlrange="-3.0 3.0"/>
+    <motor name="Arm_L1_Joint" joint="Arm_L1_Joint" ctrlrange="-108 108"/>
+    <motor name="Arm_L2_Joint" joint="Arm_L2_Joint" ctrlrange="-108 108"/>
+    <motor name="Arm_L3_Joint" joint="Arm_L3_Joint" ctrlrange="-66 66"/>
+    <motor name="Arm_L4_Joint" joint="Arm_L4_Joint" ctrlrange="-66 66"/>
+    <motor name="Arm_L5_Joint" joint="Arm_L5_Joint" ctrlrange="-18 18"/>
+    <motor name="Arm_L6_Joint" joint="Arm_L6_Joint" ctrlrange="-18 18"/>
+    <motor name="Arm_L7_Joint" joint="Arm_L7_Joint" ctrlrange="-18 18"/>
 
-    <velocity name="Arm_R1_Joint" joint="Arm_R1_Joint" kv="80" ctrlrange="-2.0 2.0"/>
-    <velocity name="Arm_R2_Joint" joint="Arm_R2_Joint" kv="80" ctrlrange="-2.0 2.0"/>
-    <velocity name="Arm_R3_Joint" joint="Arm_R3_Joint" kv="60" ctrlrange="-2.0 2.0"/>
-    <velocity name="Arm_R4_Joint" joint="Arm_R4_Joint" kv="60" ctrlrange="-2.0 2.0"/>
-    <velocity name="Arm_R5_Joint" joint="Arm_R5_Joint" kv="25" ctrlrange="-3.0 3.0"/>
-    <velocity name="Arm_R6_Joint" joint="Arm_R6_Joint" kv="25" ctrlrange="-3.0 3.0"/>
-    <velocity name="Arm_R7_Joint" joint="Arm_R7_Joint" kv="25" ctrlrange="-3.0 3.0"/>
-    <velocity name="left_gripper_left_finger_joint" joint="left_gripper_left_finger_joint" kv="200" ctrlrange="-0.05 0.05"/>
-    <velocity name="right_gripper_left_finger_joint" joint="right_gripper_left_finger_joint" kv="200" ctrlrange="-0.05 0.05"/>
+    <motor name="Arm_R1_Joint" joint="Arm_R1_Joint" ctrlrange="-108 108"/>
+    <motor name="Arm_R2_Joint" joint="Arm_R2_Joint" ctrlrange="-108 108"/>
+    <motor name="Arm_R3_Joint" joint="Arm_R3_Joint" ctrlrange="-66 66"/>
+    <motor name="Arm_R4_Joint" joint="Arm_R4_Joint" ctrlrange="-66 66"/>
+    <motor name="Arm_R5_Joint" joint="Arm_R5_Joint" ctrlrange="-18 18"/>
+    <motor name="Arm_R6_Joint" joint="Arm_R6_Joint" ctrlrange="-18 18"/>
+    <motor name="Arm_R7_Joint" joint="Arm_R7_Joint" ctrlrange="-18 18"/>
+    <motor name="left_gripper_left_finger_joint" joint="left_gripper_left_finger_joint" ctrlrange="-30 30"/>
+    <motor name="right_gripper_left_finger_joint" joint="right_gripper_left_finger_joint" ctrlrange="-30 30"/>
   </actuator>
 
 
