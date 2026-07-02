@@ -205,12 +205,42 @@ target_link_libraries(sin_yz_pin
   ${GLFW3_LIBRARIES}
 )
 
+# executable: replay_yz_pin — record first yz cycle, replay actual joints with Pinocchio inverse dynamics
+add_executable(replay_yz_pin
+  src/replay_yz_pin.cpp
+  simulate_mujoco/simulate.cc
+  simulate_mujoco/glfw_adapter.cc
+  simulate_mujoco/glfw_dispatch.cc
+  simulate_mujoco/platform_ui_adapter.cc
+  simulate_mujoco/lodepng.cpp
+)
+target_include_directories(replay_yz_pin PRIVATE
+  ${MUJOCO_INCLUDE_DIR}
+  ${GLFW3_INCLUDE_DIRS}
+  ${PINOCCHIO_INC}
+  ${EIGEN3_INCLUDE_DIRS}
+  ${CMAKE_CURRENT_SOURCE_DIR}/simulate_mujoco
+)
+ament_target_dependencies(replay_yz_pin
+  rclcpp
+  sensor_msgs
+  std_msgs
+  tf2_ros
+  geometry_msgs
+)
+target_link_libraries(replay_yz_pin
+  pinocchio::pinocchio
+  ${MUJOCO_LIBRARY}
+  ${GLFW3_LIBRARIES}
+)
+
 # install
 set(ROBO_DESCRIPTION_INSTALL_TARGETS
   robo_des
   sin_xz_control
   sin_yz_control
   sin_yz_pin
+  replay_yz_pin
 )
 if(TARGET impedance_control_node)
   list(APPEND ROBO_DESCRIPTION_INSTALL_TARGETS impedance_control_node)
