@@ -1,38 +1,35 @@
-// Pinocchio逆动力学补偿+PD关节姿态+yz平面8字任务空间控制
-// MuJoCo负责仿真和可视化，Pinocchio从同一个MJCF模型计算逆动力学
+// yz平面8字轨迹速度控制 + 记录/回放
+// MuJoCo负责仿真和可视化，marvin_v.xml中的actuator为velocity servo
 
 //Copyright 2024
 //
 // L-shape dual-arm robot with figure-8 left-gripper trajectory.
 // - Full MuJoCo 3.x UI (panels, sliders, double-click perturbation, keyframes, history)
-// - Pinocchio: FULL dynamics — M(q), C(q,q̇), g(q), FK, Jacobian, J̇
-// - Operational-space impedance control with dynamic decoupling
+// - Pinocchio: FK and Jacobian
+// - Hierarchical task-space velocity control
 // - ROS2: joint_states, TF, EE pose topics for PlotJuggler
 //
 // Architecture:
 //   Main thread:  MuJoCo UI (Simulate::RenderLoop) + ROS2 publishing
-//   Physics thread: Pinocchio dynamics + impedance controller + mj_step
+//   Physics thread: Pinocchio kinematics + velocity controller + mj_step
 //
-// Control law (per arm):
-//   τ = M(q)·J̄·(ẍ_des − J̇·q̇) + C(q,q̇)·q̇ + g(q)  +  Nᵀ·τ_posture
-//   where J̄ = M⁻¹·Jᵀ·(J·M⁻¹·Jᵀ)⁻¹  (dynamically consistent pseudo-inverse)
-//         ẍ_des = target_acc + M_des⁻¹·(Kp·Δx + Kd·Δẋ)  (with feed-forward)
-//         Nᵀ = I − Jᵀ·J̄ᵀ  (null-space projector)
+// Control law:
+//   first cycle: hierarchical damped least-squares velocity tasks
+//     J(q) qdot_cmd = xdot_ref + Kp * (x_ref - x)
+//   replay cycles: qdot_cmd = qdot_des + Kp * (q_des - q) + Kd * (qdot_des - qdot)
 //
 // Target: arms form L-shape (upper arm horizontal, forearm down).
 //         Left gripper traces a figure-8 (∞) in a plane.
 //         Right arm holds static L-shape.
 
 /*
-ros2 launch robo_description replay_yz_pin.launch.py \
-  Kp_x:=2500.0 \
-  Kp_y:=900.0 \
-  Kp_z:=1200.0 \
-  Kd_x:=350.0 \
-  Kd_y:=180.0 \
-  Kd_z:=240.0 \
-  Kq_posture:=300.0 \
-  Dq_posture:=45.0 \
+ros2 launch robo_description replay_yz_pin_v.launch.py \
+  Kp_x:=8.0 \
+  Kp_y:=8.0 \
+  Kp_z:=8.0 \
+  Kq_posture:=2.0 \
+  replay_Kp:=4.0 \
+  replay_Kd:=0.5 \
   figure8_frequency:=0.25 \
   figure8_amplitude_x:=0.08 \
   figure8_amplitude_z:=0.06
@@ -60,11 +57,9 @@ ros2 launch robo_description replay_yz_pin.launch.py \
 
 #include <mujoco/mujoco.h>
 
-#include <pinocchio/algorithm/crba.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
-#include <pinocchio/algorithm/rnea.hpp>
 #include <pinocchio/multibody/model.hpp>
 #include <pinocchio/parsers/mjcf.hpp>
 
@@ -83,30 +78,17 @@ class ImpedanceController
 public:
   ImpedanceController(const std::string& mjcf_path,
                       const Eigen::Vector3d& Kp_task,
-                      const Eigen::Vector3d& Kd_task,
-                      double Kp_null, double Kd_null,
-                      double Kq_posture, double Dq_posture,
+                      double Kq_posture,
                       double replay_Kp, double replay_Kd,
-                      double ilc_Lp, double ilc_Ld,
-                      double ilc_learning_rate,
-                      double ilc_max_delta_qdd,
-                      double ilc_max_qdd_ff,
                       double max_desired_qdd,
-                      double m_des,
                       const std::string& left_ee_name,
                       const std::string& right_ee_name,
                       double fig8_freq, double fig8_amp_x, double fig8_amp_z,
                       const std::string& fig8_plane)
-    : Kp_task_(Kp_task), Kd_task_(Kd_task)
-    , Kp_null_(Kp_null), Kd_null_(Kd_null)
-    , Kq_posture_(Kq_posture), Dq_posture_(Dq_posture)
+    : Kp_task_(Kp_task)
+    , Kq_posture_(Kq_posture)
     , replay_Kp_(replay_Kp), replay_Kd_(replay_Kd)
-    , ilc_Lp_(ilc_Lp), ilc_Ld_(ilc_Ld)
-    , ilc_learning_rate_(ilc_learning_rate)
-    , ilc_max_delta_qdd_(ilc_max_delta_qdd)
-    , ilc_max_qdd_ff_(ilc_max_qdd_ff)
     , max_desired_qdd_(max_desired_qdd)
-    , m_des_(m_des)
     , fig8_freq_(fig8_freq)
     , fig8_amp_x_(fig8_amp_x)
     , fig8_amp_z_(fig8_amp_z)
@@ -115,7 +97,6 @@ public:
     // Load Pinocchio model from the same MJCF used by MuJoCo.
     pinocchio::mjcf::buildModel(mjcf_path, pin_model_);
     pin_data_ = std::make_unique<pinocchio::Data>(pin_model_);
-    pin_data_bias_ = std::make_unique<pinocchio::Data>(pin_model_);
     pin_data_desired_ = std::make_unique<pinocchio::Data>(pin_model_);
 
     left_ee_frame_id_  = static_cast<int>(pin_model_.getFrameId(left_ee_name));
@@ -131,10 +112,7 @@ public:
     printf("Right EE frame: '%s' id=%d\n", right_ee_name.c_str(), right_ee_frame_id_);
     printf("Left  upper frame: 'Arm_L3_Link' id=%d\n", left_upper_frame_id_);
     printf("Left  forearm frame: 'Arm_L5_Link' id=%d\n", left_forearm_frame_id_);
-    printf("Desired mass (M_des): %.1f kg\n", m_des_);
-    printf("Replay joint PD: Kp=%.1f Kd=%.1f\n", replay_Kp_, replay_Kd_);
-    printf("ILC: Lp=%.2f Ld=%.2f learning_rate=%.2f max_delta_qdd=%.2f max_qdd_ff=%.2f\n",
-           ilc_Lp_, ilc_Ld_, ilc_learning_rate_, ilc_max_delta_qdd_, ilc_max_qdd_ff_);
+    printf("Replay joint velocity tracking: Kp=%.2f Kd=%.2f\n", replay_Kp_, replay_Kd_);
   }
 
   // Must be called AFTER mjModel is loaded
@@ -151,8 +129,7 @@ public:
            pin_joint_names_.size(), (long)m->nu);
   }
 
-  // One control step: read state, compute full Pinocchio dynamics,
-  // impedance torques, write to mjData.ctrl
+  // One control step: read state, compute kinematics, write velocity commands.
   void control_step(mjData* d)
   {
     if (!mj_model_) return;
@@ -164,14 +141,10 @@ public:
     for (size_t i = 0; i < pin_joint_names_.size(); ++i)
       qd[pin_v_idx_[i]] = d->qvel[mj_dof_adr_[i]];
 
-    // Pinocchio: full dynamics computation
+    // Pinocchio kinematics for FK/Jacobians.
     pinocchio::forwardKinematics(pin_model_, *pin_data_, q, qd);
     pinocchio::updateFramePlacements(pin_model_, *pin_data_);
     pinocchio::computeJointJacobians(pin_model_, *pin_data_, q);
-
-    // dynamic 
-    pinocchio::crba(pin_model_, *pin_data_, q);                       // M(q)
-    pinocchio::nonLinearEffects(pin_model_, *pin_data_, q, qd);       // nle = C·q̇ + g
 
     // Initialize L-shape configuration on first call
     if (!trajectory_initialized_) {
@@ -214,12 +187,10 @@ public:
     // 左臂：8字轨迹
     Eigen::Vector3d left_target_pos = l_shape_left_ee_ + fig8.pos;
     Eigen::Vector3d left_target_vel = fig8.vel;
-    Eigen::Vector3d left_target_acc = fig8.acc;
 
     // 右臂：静止目标
     Eigen::Vector3d right_target_pos = l_shape_right_ee_;
     Eigen::Vector3d right_target_vel = Eigen::Vector3d::Zero();
-    Eigen::Vector3d right_target_acc = Eigen::Vector3d::Zero();
 
     if (!recording_complete_) {
       current_left_target_  = left_target_pos;
@@ -238,20 +209,17 @@ public:
       return;
     }
 
-    // ===== Stable controller: MuJoCo bias + J^T F + joint posture PD =====
+    // ===== Velocity controller: hierarchical task velocity + joint posture =====
     {
       mj_forward(mj_model_, d);
 
-      Eigen::VectorXd tau(pin_model_.nv);
-      tau.setZero();
-
       const int nv = pin_model_.nv;
 
-      Eigen::VectorXd qdd_cmd = Eigen::VectorXd::Zero(nv);
+      Eigen::VectorXd qd_cmd = Eigen::VectorXd::Zero(nv);
       Eigen::MatrixXd N = Eigen::MatrixXd::Identity(nv, nv);
 
-      auto add_acc_task = [&](const Eigen::MatrixXd& J_task,
-                              const Eigen::VectorXd& b_task,
+      auto add_vel_task = [&](const Eigen::MatrixXd& J_task,
+                              const Eigen::VectorXd& v_task,
                               double lambda)
       {
         const int task_dim = static_cast<int>(J_task.rows());
@@ -263,17 +231,16 @@ public:
             J_eff.transpose() * regularized.ldlt().solve(
                 Eigen::MatrixXd::Identity(task_dim, task_dim));
 
-        Eigen::VectorXd residual = b_task - J_task * qdd_cmd;
-        qdd_cmd += N * J_eff_pinv * residual;
+        Eigen::VectorXd residual = v_task - J_task * qd_cmd;
+        qd_cmd += N * J_eff_pinv * residual;
         N = N * (Eigen::MatrixXd::Identity(nv, nv) - J_eff_pinv * J_eff);
       };
 
-      auto task_accel_target = [&](int ee_frame_id,
+      auto task_velocity_target = [&](int ee_frame_id,
                                    const Eigen::Vector3d& target_pos,
                                    const Eigen::Vector3d& target_vel,
-                                   const Eigen::Vector3d& target_acc,
                                    Eigen::MatrixXd& J_lin,
-                                   Eigen::Vector3d& b)
+                                   Eigen::Vector3d& v_des)
       {
         const auto& oMf = pin_data_->oMf[ee_frame_id];
         Eigen::Vector3d x = oMf.translation();
@@ -283,51 +250,39 @@ public:
             pinocchio::LOCAL_WORLD_ALIGNED);
         J_lin = J6.topRows<3>();
 
-        Eigen::Vector3d x_dot = J_lin * qd;
         Eigen::Vector3d e = target_pos - x;
-        Eigen::Vector3d e_dot = target_vel - x_dot;
-
-        Eigen::VectorXd qdd_zero = Eigen::VectorXd::Zero(nv);
-        pinocchio::forwardKinematics(pin_model_, *pin_data_bias_, q, qd, qdd_zero);
-        auto bias = pinocchio::getFrameClassicalAcceleration(
-            pin_model_, *pin_data_bias_, ee_frame_id,
-            pinocchio::LOCAL_WORLD_ALIGNED);
-
-        Eigen::Vector3d x_ddot_des =
-            target_acc
-          + (Kp_task_.cwiseProduct(e) + Kd_task_.cwiseProduct(e_dot)) / m_des_;
-        b = x_ddot_des - bias.linear();
+        v_des = target_vel + Kp_task_.cwiseProduct(e);
       };
 
       Eigen::MatrixXd J_left, J_right;
-      Eigen::Vector3d b_left, b_right;
-      task_accel_target(left_ee_frame_id_,
-                        left_target_pos, left_target_vel, left_target_acc,
-                        J_left, b_left);
-      task_accel_target(right_ee_frame_id_,
-                        right_target_pos, right_target_vel, right_target_acc,
-                        J_right, b_right);
+      Eigen::Vector3d v_left, v_right;
+      task_velocity_target(left_ee_frame_id_,
+                           left_target_pos, left_target_vel,
+                           J_left, v_left);
+      task_velocity_target(right_ee_frame_id_,
+                           right_target_pos, right_target_vel,
+                           J_right, v_right);
 
       Eigen::MatrixXd J_left_x(1, nv);
       J_left_x.row(0) = J_left.row(0);
-      Eigen::VectorXd b_left_x(1);
-      b_left_x << b_left.x();
+      Eigen::VectorXd v_left_x(1);
+      v_left_x << v_left.x();
 
       Eigen::MatrixXd J_left_yz(2, nv);
       J_left_yz.row(0) = J_left.row(1);
       J_left_yz.row(1) = J_left.row(2);
-      Eigen::Vector2d b_left_yz;
-      b_left_yz << b_left.y(), b_left.z();
+      Eigen::Vector2d v_left_yz;
+      v_left_yz << v_left.y(), v_left.z();
 
-      // 2) Hierarchical acceleration tasks:
+      // 2) Hierarchical velocity tasks:
       //    left tool x > left yz path > right hold > posture.
       // Keep this close to the stable xz controller: do not over-constrain
       // intermediate links in yz, otherwise Arm_L1/R2/R3 saturate near turns.
-      add_acc_task(J_left_x, b_left_x, 1e-8);
-      add_acc_task(J_left_yz, b_left_yz, 5e-5);
-      add_acc_task(J_right, b_right, 1e-3);
+      add_vel_task(J_left_x, v_left_x, 1e-8);
+      add_vel_task(J_left_yz, v_left_yz, 5e-5);
+      add_vel_task(J_right, v_right, 1e-3);
 
-      Eigen::VectorXd qdd_posture = Eigen::VectorXd::Zero(nv);
+      Eigen::VectorXd qd_posture = Eigen::VectorXd::Zero(nv);
       for (size_t i = 0; i < pin_joint_names_.size(); ++i) {
         const std::string& name = pin_joint_names_[i];
 
@@ -339,53 +294,23 @@ public:
         int pin_q = pin_q_idx_[i];
         int pin_v = pin_v_idx_[i];
 
-        qdd_posture[pin_v] = Kq_posture_ * (q_rest_[pin_q] - q[pin_q])
-                            - Dq_posture_ * qd[pin_v];
+        qd_posture[pin_v] = Kq_posture_ * (q_rest_[pin_q] - q[pin_q]);
       }
 
-      qdd_cmd += N * qdd_posture;
-      tau = pinocchio_inverse_dynamics(q, qd, qdd_cmd);
+      qd_cmd += N * qd_posture;
 
       record_actual_joint_sample(t, q, qd);
 
-      apply_torques_to_mujoco(d, tau);
+      apply_joint_velocities_to_mujoco(d, qd_cmd);
 
-      last_tau_ = tau;
+      last_qd_cmd_ = qd_cmd;
       last_q_ = q;
       last_qd_ = qd;
-      last_qdd_ = qdd_cmd;
+      last_qdd_ = (qd_cmd - qd) / std::max(dt_, 1e-6);
       return;
     }
 
-    // =====================================================================
-    // Full dynamics operational-space impedance control
-    // =====================================================================
-    Eigen::VectorXd tau_left = compute_arm_torque(
-        q, qd,
-        left_ee_frame_id_,
-        left_target_pos,
-        left_target_vel,
-        left_target_acc);
-
-    Eigen::VectorXd tau_right = compute_arm_torque(
-        q, qd,
-        right_ee_frame_id_,
-        right_target_pos,
-        right_target_vel,
-        right_target_acc);
-    Eigen::VectorXd tau = tau_left + tau_right - pin_data_-> nle;  // nle already contains C·q̇ + g for all joints
-
-    // Clamp torques
-    const double max_torque = 200.0;
-    for (int i = 0; i < pin_model_.nv; ++i)
-      tau[i] = std::max(-max_torque, std::min(max_torque, tau[i]));
-
-    apply_torques_to_mujoco(d, tau);
-
-    last_tau_ = tau;
-    last_q_ = q;
-    last_qd_ = qd;
-    last_qdd_ = Eigen::VectorXd::Zero(pin_model_.nv);
+    return;
   }
 
   // Accessors for ROS2 publishing
@@ -395,7 +320,7 @@ public:
   const Eigen::VectorXd& desired_q() const { return desired_q_; }
   const Eigen::VectorXd& desired_qd() const { return desired_qd_; }
   const Eigen::VectorXd& desired_qdd() const { return desired_qdd_; }
-  const Eigen::VectorXd& last_tau() const { return last_tau_; }
+  const Eigen::VectorXd& last_qd_cmd() const { return last_qd_cmd_; }
   const std::vector<std::string>& joint_names() const { return pin_joint_names_; }
   const std::vector<int>& pin_q_idx() const { return pin_q_idx_; }
   const std::vector<int>& pin_v_idx() const { return pin_v_idx_; }
@@ -610,7 +535,7 @@ private:
     return q;
   }
 
-  void apply_torques_to_mujoco(mjData* d, const Eigen::VectorXd& tau)
+  void apply_joint_velocities_to_mujoco(mjData* d, const Eigen::VectorXd& qd_cmd)
   {
     std::fill(d->ctrl, d->ctrl + mj_model_->nu, 0.0);
 
@@ -619,7 +544,7 @@ private:
       if (act_id < 0) continue;
       if (i >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[i]) continue;
 
-      double cmd = tau[i];
+      double cmd = qd_cmd[i];
 
       // MuJoCo actuator ctrlrange
       double lo = mj_model_->actuator_ctrlrange[2 * act_id + 0];
@@ -637,48 +562,12 @@ private:
 
       if (saturated && should_log_saturation(act_id, d->time)) {
         const char* act_name = mj_id2name(mj_model_, mjOBJ_ACTUATOR, act_id);
-        printf("[SAT] actuator=%s tau=%.2f clipped to [%.2f, %.2f]\n",
-               act_name ? act_name : "unknown", tau[i], lo, hi);
+        printf("[SAT] actuator=%s qd_cmd=%.2f clipped to [%.2f, %.2f]\n",
+               act_name ? act_name : "unknown", qd_cmd[i], lo, hi);
       }
 
       d->ctrl[act_id] = cmd;
     }
-  }
-
-  Eigen::VectorXd pinocchio_inverse_dynamics(const Eigen::VectorXd& q,
-                                             const Eigen::VectorXd& qd,
-                                             const Eigen::VectorXd& qdd_cmd)
-  {
-    Eigen::VectorXd tau = pinocchio::rnea(pin_model_, *pin_data_, q, qd, qdd_cmd);
-
-    for (size_t i = 0; i < pin_joint_names_.size(); ++i) {
-      const int pin_v = pin_v_idx_[i];
-      const int mj_dof = mj_dof_adr_[i];
-      if (pin_v < 0 || pin_v >= pin_model_.nv ||
-          pin_v >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[pin_v]) {
-        continue;
-      }
-
-      // Pinocchio's MJCF parser does not model MuJoCo's joint-side passive
-      // terms. Add them explicitly so the torque is closer to mj_inverse while
-      // keeping Pinocchio as the rigid-body inverse dynamics engine.
-      const double armature = mj_model_->dof_armature[mj_dof];
-      const double damping = mj_model_->dof_damping[mj_dof];
-      const double frictionloss = mj_model_->dof_frictionloss[mj_dof];
-      const double v = qd[pin_v];
-      const double friction_sign = std::tanh(v / 0.01);
-
-      tau[pin_v] += armature * qdd_cmd[pin_v]
-                  + damping * v
-                  + frictionloss * friction_sign;
-    }
-
-    for (int i = 0; i < pin_model_.nv; ++i) {
-      if (i >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[i]) {
-        tau[i] = 0.0;
-      }
-    }
-    return tau;
   }
 
   struct JointSample
@@ -692,7 +581,6 @@ private:
   struct ReplayReference
   {
     JointSample sample;
-    Eigen::VectorXd qdd_ff;
     size_t lo = 0;
     size_t hi = 0;
     double alpha = 0.0;
@@ -789,13 +677,11 @@ private:
     replay_started_ = false;
     replay_start_time_ = start_sim_time_ + replay_cycle_duration_;
     replay_cycle_index_ = 1;
-    initialize_ilc_feedforward();
     reset_replay_metrics();
 
     printf("[REPLAY] Recorded first real joint trajectory: samples=%zu duration=%.3f s\n",
            recorded_trajectory_.size(), replay_cycle_duration_);
-    printf("[REPLAY] From cycle 2 onward, using C1 shape-preserving recorded joints as desired and tracking with joint PD + Pinocchio RNEA.\n");
-    printf("[ILC] Feed-forward qdd will be updated after each replay cycle from the previous cycle tracking error.\n");
+    printf("[REPLAY] From cycle 2 onward, using C1 shape-preserving recorded joints as desired and tracking with joint velocity commands.\n");
   }
 
   ReplayReference sample_replay_reference(double t_in_cycle) const
@@ -805,21 +691,18 @@ private:
     out.sample.q = Eigen::VectorXd::Zero(pin_model_.nq);
     out.sample.qd = Eigen::VectorXd::Zero(pin_model_.nv);
     out.sample.qdd = Eigen::VectorXd::Zero(pin_model_.nv);
-    out.qdd_ff = Eigen::VectorXd::Zero(pin_model_.nv);
 
     if (recorded_trajectory_.empty()) {
       return out;
     }
     if (recorded_trajectory_.size() == 1 || t_in_cycle <= recorded_trajectory_.front().t) {
       out.sample = recorded_trajectory_.front();
-      out.qdd_ff = ilc_qdd_ff_.empty() ? out.sample.qdd : ilc_qdd_ff_.front();
       return out;
     }
     if (t_in_cycle >= recorded_trajectory_.back().t) {
       out.sample = recorded_trajectory_.back();
       out.lo = recorded_trajectory_.size() - 1;
       out.hi = out.lo;
-      out.qdd_ff = ilc_qdd_ff_.empty() ? out.sample.qdd : ilc_qdd_ff_.back();
       return out;
     }
 
@@ -884,141 +767,7 @@ private:
       out.sample.qd[pin_v] = q_dot_as_q[pin_q];
       out.sample.qdd[pin_v] = q_ddot_as_q[pin_q];
     }
-    if (!ilc_qdd_ff_.empty() && hi < ilc_qdd_ff_.size()) {
-      out.qdd_ff = (1.0 - alpha) * ilc_qdd_ff_[hi - 1] + alpha * ilc_qdd_ff_[hi];
-    } else {
-      out.qdd_ff = out.sample.qdd;
-    }
     return out;
-  }
-
-  void initialize_ilc_feedforward()
-  {
-    ilc_qdd_ff_.clear();
-    ilc_qdd_delta_sum_.clear();
-    ilc_weight_sum_.clear();
-    ilc_qdd_ff_.reserve(recorded_trajectory_.size());
-    for (const auto& sample : recorded_trajectory_) {
-      (void)sample;
-      ilc_qdd_ff_.push_back(Eigen::VectorXd::Zero(pin_model_.nv));
-    }
-    reset_ilc_accumulators();
-  }
-
-  void smooth_ilc_feedforward()
-  {
-    const size_t n = ilc_qdd_ff_.size();
-    if (n < 3) return;
-
-    auto cyclic_sample_index = [&](int idx) -> size_t {
-      if (idx < 0) return n - 2;
-      if (idx >= static_cast<int>(n)) return 1;
-      return static_cast<size_t>(idx);
-    };
-
-    for (int pass = 0; pass < 3; ++pass) {
-      std::vector<Eigen::VectorXd> filtered = ilc_qdd_ff_;
-      for (size_t i = 0; i < n; ++i) {
-        const size_t prev = cyclic_sample_index(static_cast<int>(i) - 1);
-        const size_t next = cyclic_sample_index(static_cast<int>(i) + 1);
-        filtered[i] = 0.25 * ilc_qdd_ff_[prev] + 0.50 * ilc_qdd_ff_[i]
-                    + 0.25 * ilc_qdd_ff_[next];
-      }
-      ilc_qdd_ff_.swap(filtered);
-    }
-
-    for (auto& qdd : ilc_qdd_ff_) {
-      for (int v = 0; v < qdd.size(); ++v) {
-        if (v >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[v]) {
-          qdd[v] = 0.0;
-        } else {
-          qdd[v] = std::max(-ilc_max_qdd_ff_,
-                            std::min(ilc_max_qdd_ff_, qdd[v]));
-        }
-      }
-    }
-    ilc_qdd_ff_.back() = ilc_qdd_ff_.front();
-  }
-
-  void reset_ilc_accumulators()
-  {
-    ilc_qdd_delta_sum_.assign(
-        recorded_trajectory_.size(), Eigen::VectorXd::Zero(pin_model_.nv));
-    ilc_weight_sum_.assign(recorded_trajectory_.size(), 0.0);
-  }
-
-  void accumulate_ilc_error(const ReplayReference& ref,
-                            const Eigen::VectorXd& q,
-                            const Eigen::VectorXd& qd)
-  {
-    if (recorded_trajectory_.empty() ||
-        ilc_qdd_delta_sum_.size() != recorded_trajectory_.size()) {
-      return;
-    }
-
-    Eigen::VectorXd delta = Eigen::VectorXd::Zero(pin_model_.nv);
-    for (size_t i = 0; i < pin_joint_names_.size(); ++i) {
-      const int pin_q = pin_q_idx_[i];
-      const int pin_v = pin_v_idx_[i];
-      if (pin_v < 0 || pin_v >= pin_model_.nv ||
-          pin_v >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[pin_v]) {
-        continue;
-      }
-      delta[pin_v] = ilc_Lp_ * (ref.sample.q[pin_q] - q[pin_q])
-                   + ilc_Ld_ * (ref.sample.qd[pin_v] - qd[pin_v]);
-      delta[pin_v] = std::max(-ilc_max_delta_qdd_,
-                              std::min(ilc_max_delta_qdd_, delta[pin_v]));
-    }
-
-    auto add_weighted = [&](size_t idx, double weight) {
-      if (idx >= ilc_qdd_delta_sum_.size() || weight <= 0.0) return;
-      ilc_qdd_delta_sum_[idx] += weight * delta;
-      ilc_weight_sum_[idx] += weight;
-    };
-
-    if (ref.lo == ref.hi) {
-      add_weighted(ref.lo, 1.0);
-    } else {
-      add_weighted(ref.lo, 1.0 - ref.alpha);
-      add_weighted(ref.hi, ref.alpha);
-    }
-  }
-
-  void apply_ilc_update(int completed_cycle)
-  {
-    if (ilc_qdd_ff_.size() != recorded_trajectory_.size() ||
-        ilc_qdd_delta_sum_.size() != recorded_trajectory_.size()) {
-      return;
-    }
-
-    double rms_delta = 0.0;
-    double max_delta = 0.0;
-    int count = 0;
-    for (size_t idx = 0; idx < ilc_qdd_ff_.size(); ++idx) {
-      if (ilc_weight_sum_[idx] <= 1e-12) continue;
-      Eigen::VectorXd avg_delta = ilc_qdd_delta_sum_[idx] / ilc_weight_sum_[idx];
-      for (int v = 0; v < avg_delta.size(); ++v) {
-        if (v >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[v]) {
-          avg_delta[v] = 0.0;
-          continue;
-        }
-        const double learned_delta = ilc_learning_rate_ * avg_delta[v];
-        ilc_qdd_ff_[idx][v] += learned_delta;
-        ilc_qdd_ff_[idx][v] = std::max(-ilc_max_qdd_ff_,
-                                       std::min(ilc_max_qdd_ff_, ilc_qdd_ff_[idx][v]));
-        rms_delta += learned_delta * learned_delta;
-        max_delta = std::max(max_delta, std::abs(learned_delta));
-        ++count;
-      }
-    }
-
-    if (count > 0) {
-      rms_delta = std::sqrt(rms_delta / static_cast<double>(count));
-    }
-    smooth_ilc_feedforward();
-    printf("[ILC][after cycle %d] updated next-cycle qdd_ff: delta_rms=%.6f rad/s^2 delta_max=%.6f rad/s^2 active_samples=%zu\n",
-           completed_cycle, rms_delta, max_delta, ilc_qdd_ff_.size());
-    reset_ilc_accumulators();
   }
 
   void reset_replay_metrics()
@@ -1130,7 +879,6 @@ private:
     const int current_cycle = 2 + completed_cycles;
     if (current_cycle != replay_cycle_index_) {
       print_replay_metrics(replay_cycle_index_);
-      apply_ilc_update(replay_cycle_index_);
       replay_cycle_index_ = current_cycle;
       reset_replay_metrics();
       printf("[REPLAY] Starting replay cycle %d at sim_time=%.3f\n",
@@ -1153,7 +901,7 @@ private:
     current_left_target_ = ref_data.oMf[left_ee_frame_id_].translation();
     current_right_target_ = ref_data.oMf[right_ee_frame_id_].translation();
 
-    Eigen::VectorXd qdd_cmd = ref.qdd_ff;
+    Eigen::VectorXd qd_cmd = desired_qd_;
     for (size_t i = 0; i < pin_joint_names_.size(); ++i) {
       const int pin_q = pin_q_idx_[i];
       const int pin_v = pin_v_idx_[i];
@@ -1161,23 +909,20 @@ private:
           pin_v >= static_cast<int>(pin_v_is_arm_.size()) || !pin_v_is_arm_[pin_v]) {
         continue;
       }
-      qdd_cmd[pin_v] += replay_Kp_ * (ref.sample.q[pin_q] - q[pin_q])
-                      + replay_Kd_ * (desired_qd_[pin_v] - qd[pin_v]);
+      qd_cmd[pin_v] += replay_Kp_ * (ref.sample.q[pin_q] - q[pin_q])
+                     + replay_Kd_ * (desired_qd_[pin_v] - qd[pin_v]);
     }
 
-    Eigen::VectorXd tau = pinocchio_inverse_dynamics(q, qd, qdd_cmd);
-    apply_torques_to_mujoco(d, tau);
+    apply_joint_velocities_to_mujoco(d, qd_cmd);
 
-    last_tau_ = tau;
+    last_qd_cmd_ = qd_cmd;
     last_q_ = q;
     last_qd_ = qd;
-    last_qdd_ = qdd_cmd;
+    last_qdd_ = (qd_cmd - qd) / std::max(dt_, 1e-6);
     JointSample limited_ref = ref.sample;
     limited_ref.qd = desired_qd_;
     limited_ref.qdd = desired_qdd_;
     update_replay_metrics(q, qd, limited_ref);
-    ref.sample = limited_ref;
-    accumulate_ilc_error(ref, q, qd);
   }
 
   void update_desired_joint_state(const Eigen::Vector3d& left_target_pos,
@@ -1311,101 +1056,10 @@ private:
   }
 
   // ========================================================================
-  // Full operational-space impedance control with dynamic decoupling
-  //
-  //   τ = M·J̄·(ẍ_des − J̇·q̇)  +  (I − Jᵀ·J̄ᵀ)·τ_posture  +  nle
-  //
-  //   J̄   = M⁻¹·Jᵀ·(J·M⁻¹·Jᵀ)⁻¹    dynamically consistent pseudo-inverse
-  //   ẍ_des = target_acc + M_des⁻¹·(Kp·Δx + Kd·Δẋ)   with feed-forward
-  //   nle = C·q̇ + g                   non-linear effects (Coriolis + gravity)
-  //
-  // The (I − Jᵀ·J̄ᵀ) term projects τ_posture into the null-space of the
-  // task, so posture control never interferes with EE tracking.
-  // ========================================================================
-  Eigen::VectorXd compute_arm_torque(
-      const Eigen::VectorXd& q,
-      const Eigen::VectorXd& qd,
-      int ee_frame_id,
-      const Eigen::Vector3d& target_pos,
-      const Eigen::Vector3d& target_vel,
-      const Eigen::Vector3d& target_acc)
-  {
-    const int nv = pin_model_.nv;
-
-    // --- Current EE state ---
-    const auto& oMf = pin_data_->oMf[ee_frame_id];
-    Eigen::Vector3d x = oMf.translation();
-    Eigen::Vector3d e = target_pos - x;                   // position error
-
-    // --- Jacobian (linear part, 3×N) ---
-    Eigen::MatrixXd J6 = pinocchio::getFrameJacobian(
-        pin_model_, *pin_data_, ee_frame_id, pinocchio::LOCAL_WORLD_ALIGNED);
-    Eigen::MatrixXd J_lin = J6.topRows<3>();
-    Eigen::Vector3d x_dot = J_lin * qd;                   // EE velocity
-
-    // 速度误差
-    Eigen::Vector3d e_dot = target_vel - x_dot;
-
-    // --- Pinocchio-computed dynamics ---
-    const Eigen::MatrixXd& M   = pin_data_->M;            // nv×nv mass matrix
-    const Eigen::VectorXd& nle = pin_data_->nle;          // C·q̇ + g
-
-    // --- Task-space inertia: Λ = (J·M⁻¹·Jᵀ)⁻¹ ---
-    // Solve M·X = Jᵀ  →  X = M⁻¹·Jᵀ  (3 linear systems)
-    Eigen::MatrixXd M_inv_Jt = M.llt().solve(J_lin.transpose());  // nv×3
-    Eigen::Matrix3d Lambda_inv = J_lin * M_inv_Jt;                 // 3×3
-
-    double det = Lambda_inv.determinant();
-    if (std::abs(det) < 1e-12) {
-      // Near kinematic singularity — fall back to joint-space PD + gravity
-      Eigen::VectorXd q_err = q_rest_ - q;
-      return Kp_null_ * q_err - Kd_null_ * qd + nle;
-    }
-
-    Eigen::Matrix3d Lambda = Lambda_inv.inverse();        // task-space inertia
-
-    // --- Dynamically consistent pseudo-inverse: J̄ = M⁻¹·Jᵀ·Λ ---
-    Eigen::MatrixXd J_bar = M_inv_Jt * Lambda;            // nv×3
-
-    // --- Desired task-space acceleration (impedance law with feed-forward) ---
-    // ẍ_des = target_acc + M_des⁻¹·(Kp·Δx + Kd·Δẋ)
-    double inv_m = 1.0 / m_des_;
-    Eigen::Vector3d x_ddot_des =
-        target_acc + inv_m * (Kp_task_.cwiseProduct(e) + Kd_task_.cwiseProduct(e_dot));
-
-    // --- Bias acceleration: J̇·q̇ (velocity-product term at EE) ---
-    // Run FK with q̈=0 on the bias data; getFrameClassicalAcceleration
-    // then returns J·0 + J̇·q̇ = J̇·q̇.
-    Eigen::VectorXd qdd_zero = Eigen::VectorXd::Zero(nv);
-    pinocchio::forwardKinematics(pin_model_, *pin_data_bias_, q, qd, qdd_zero);
-    auto bias = pinocchio::getFrameClassicalAcceleration(
-        pin_model_, *pin_data_bias_, ee_frame_id, pinocchio::LOCAL_WORLD_ALIGNED);
-    Eigen::Vector3d J_dot_qd = bias.linear();             // J̇·q̇
-
-    // --- Desired joint acceleration (task contribution) ---
-    Eigen::VectorXd q_ddot_des = J_bar * (x_ddot_des - J_dot_qd);
-
-    // --- Null-space posture acceleration ---
-    // Nᵀ = I − Jᵀ·J̄ᵀ
-    Eigen::MatrixXd I_nv = Eigen::MatrixXd::Identity(nv, nv);
-    Eigen::MatrixXd N_transpose = I_nv - J_lin.transpose() * J_bar.transpose();
-
-    Eigen::VectorXd q_err = q_rest_ - q;
-    Eigen::VectorXd q_null_ddot = N_transpose * (Kp_null_ * q_err - Kd_null_ * qd);
-    q_ddot_des += q_null_ddot;
-
-    // --- Computed torque: τ = M·q̈_des + C·q̇ + g ---
-    Eigen::VectorXd tau = M * q_ddot_des + nle;
-
-    return tau;
-  }
-
-  // ========================================================================
   // Members
   // ========================================================================
   pinocchio::Model pin_model_;
   std::unique_ptr<pinocchio::Data> pin_data_;
-  std::unique_ptr<pinocchio::Data> pin_data_bias_;   // for J̇·q̇ computation
   std::unique_ptr<pinocchio::Data> pin_data_desired_;
   mjModel* mj_model_ = nullptr;
 
@@ -1419,19 +1073,12 @@ private:
   int left_ee_frame_id_ = -1, right_ee_frame_id_ = -1;
   int left_upper_frame_id_ = -1, left_forearm_frame_id_ = -1;
 
-  Eigen::Vector3d Kp_task_, Kd_task_;
+  Eigen::Vector3d Kp_task_;
   double dt_ = 0.001;
-  double Kp_null_, Kd_null_;
-  double Kq_posture_, Dq_posture_;
-  double replay_Kp_ = 120.0;
-  double replay_Kd_ = 25.0;
-  double ilc_Lp_ = 15.0;
-  double ilc_Ld_ = 3.0;
-  double ilc_learning_rate_ = 0.35;
-  double ilc_max_delta_qdd_ = 8.0;
-  double ilc_max_qdd_ff_ = 80.0;
+  double Kq_posture_;
+  double replay_Kp_ = 4.0;
+  double replay_Kd_ = 0.5;
   double max_desired_qdd_ = 6.0;
-  double m_des_ = 1.0;           // desired task-space mass (mass shaping)
 
   // Figure-8
   double fig8_freq_, fig8_amp_x_, fig8_amp_z_;
@@ -1446,14 +1093,11 @@ private:
   Eigen::Vector3d current_left_target_, current_right_target_;
 
   // Last state
-  Eigen::VectorXd last_q_, last_qd_, last_qdd_, last_tau_;
+  Eigen::VectorXd last_q_, last_qd_, last_qdd_, last_qd_cmd_;
   Eigen::VectorXd desired_q_, desired_qd_, desired_qdd_;
 
   // Recorded real joint trajectory and replay metrics
   std::vector<JointSample> recorded_trajectory_;
-  std::vector<Eigen::VectorXd> ilc_qdd_ff_;
-  std::vector<Eigen::VectorXd> ilc_qdd_delta_sum_;
-  std::vector<double> ilc_weight_sum_;
   bool recording_complete_ = false;
   bool replay_started_ = false;
   double replay_cycle_duration_ = 0.0;
@@ -1479,7 +1123,7 @@ static std::shared_ptr<rclcpp::Node> g_ros_node;
 static rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr g_joint_pub;
 static rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr g_joint_actual_pub;
 static rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr g_joint_desired_pub;
-static rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr g_left_joint_torque_pub;
+static rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr g_left_joint_velocity_cmd_pub;
 static rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr g_joint_actual_kinematics_pub;
 static rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr g_joint_desired_kinematics_pub;
 static std::unique_ptr<tf2_ros::TransformBroadcaster> g_tf_broadcaster;
@@ -1718,8 +1362,8 @@ static void publish_ros2(mj::Simulate& /*sim*/)
     g_joint_actual_pub->publish(msg);
   }
 
-  // Actual left-arm joint torques for PlotJuggler. Values come from MuJoCo
-  // actuator controls after ctrlrange clipping, so they are the applied torques.
+  // Left-arm joint velocity commands for PlotJuggler. Values come from MuJoCo
+  // actuator controls after ctrlrange clipping, so they are the applied commands.
   {
     auto msg = sensor_msgs::msg::JointState();
     msg.header.stamp = stamp;
@@ -1736,9 +1380,9 @@ static void publish_ros2(mj::Simulate& /*sim*/)
       if (act_id < 0 || act_id >= g_m->nu) continue;
 
       msg.name.push_back(joint_names[i]);
-      msg.effort.push_back(g_d->ctrl[act_id]);
+      msg.velocity.push_back(g_d->ctrl[act_id]);
     }
-    g_left_joint_torque_pub->publish(msg);
+    g_left_joint_velocity_cmd_pub->publish(msg);
   }
 
   // Desired joint states from damped least-squares IK on the desired EE path.
@@ -1906,11 +1550,11 @@ static void publish_ros2(mj::Simulate& /*sim*/)
         right_err.x(), right_err.y(), right_err.z(),
       };
 
-      const auto& tau = g_ctrl->last_tau();
-      int nv = tau.size();
+      const auto& qd_cmd = g_ctrl->last_qd_cmd();
+      int nv = qd_cmd.size();
       double left_rms = 0, right_rms = 0;
-      for (int i = 0; i < nv/2; ++i) left_rms += tau[i]*tau[i];
-      for (int i = nv/2; i < nv; ++i) right_rms += tau[i]*tau[i];
+      for (int i = 0; i < nv/2; ++i) left_rms += qd_cmd[i]*qd_cmd[i];
+      for (int i = nv/2; i < nv; ++i) right_rms += qd_cmd[i]*qd_cmd[i];
       left_rms  = std::sqrt(left_rms  / (nv/2));
       right_rms = std::sqrt(right_rms / (nv/2));
       msg.data.push_back(left_rms);
@@ -1977,38 +1621,25 @@ int main(int argc, char** argv)
 {
   // --- ROS2 init ---
   rclcpp::init(argc, argv);
-  g_ros_node = std::make_shared<rclcpp::Node>("replay_yz_pin_node");
+  g_ros_node = std::make_shared<rclcpp::Node>("replay_yz_pin_v_node");
 
   // --- Parameters ---
   const char* home = std::getenv("HOME");
   if (!home) { fprintf(stderr, "HOME not set\n"); return 1; }
 
   g_ros_node->declare_parameter("mjcf_path",
-      std::string(home) + "/my_work_pkg/src/robo_description/model/marvin_pro_mink_with_gripper.xml");
+      std::string(home) + "/my_work_pkg/src/robo_description/model/marvin_v.xml");
   g_ros_node->declare_parameter("urdf_path",
       std::string(home) + "/Marvin_Description-Robot_Description/urdf/marvin_pro/marvin_robot.urdf");
 
-  // Task-space impedance gains — per-axis: x not too strong, z stronger
-  // so that height-keeping dominates horizontal tracking
-  g_ros_node->declare_parameter("Kp_x", 2500.0);
-  g_ros_node->declare_parameter("Kp_y", 900.0);
-  g_ros_node->declare_parameter("Kp_z", 1200.0);
-  g_ros_node->declare_parameter("Kd_x", 350.0);
-  g_ros_node->declare_parameter("Kd_y", 180.0);
-  g_ros_node->declare_parameter("Kd_z", 240.0);
-  g_ros_node->declare_parameter("null_Kp", 5.0);
-  g_ros_node->declare_parameter("null_Kd", 3.0);
-  g_ros_node->declare_parameter("Kq_posture", 300.0);
-  g_ros_node->declare_parameter("Dq_posture", 45.0);
-  g_ros_node->declare_parameter("replay_Kp", 120.0);
-  g_ros_node->declare_parameter("replay_Kd", 25.0);
-  g_ros_node->declare_parameter("ilc_Lp", 15.0);
-  g_ros_node->declare_parameter("ilc_Ld", 3.0);
-  g_ros_node->declare_parameter("ilc_learning_rate", 0.35);
-  g_ros_node->declare_parameter("ilc_max_delta_qdd", 8.0);
-  g_ros_node->declare_parameter("ilc_max_qdd_ff", 80.0);
+  // Task-space velocity gains. The command is xdot_des = xdot_ref + Kp * error.
+  g_ros_node->declare_parameter("Kp_x", 8.0);
+  g_ros_node->declare_parameter("Kp_y", 8.0);
+  g_ros_node->declare_parameter("Kp_z", 8.0);
+  g_ros_node->declare_parameter("Kq_posture", 2.0);
+  g_ros_node->declare_parameter("replay_Kp", 4.0);
+  g_ros_node->declare_parameter("replay_Kd", 0.5);
   g_ros_node->declare_parameter("max_desired_qdd", 6.0);
-  g_ros_node->declare_parameter("m_des", 5.0);    // desired mass (mass shaping)
 
   // Figure-8 (small, slow — first get control stable, then scale up)
   g_ros_node->declare_parameter("figure8_frequency", 0.25);
@@ -2024,23 +1655,10 @@ int main(int argc, char** argv)
   Kp_task << g_ros_node->get_parameter("Kp_x").as_double(),
              g_ros_node->get_parameter("Kp_y").as_double(),
              g_ros_node->get_parameter("Kp_z").as_double();
-  Eigen::Vector3d Kd_task;
-  Kd_task << g_ros_node->get_parameter("Kd_x").as_double(),
-             g_ros_node->get_parameter("Kd_y").as_double(),
-             g_ros_node->get_parameter("Kd_z").as_double();
-  double Kp_null   = g_ros_node->get_parameter("null_Kp").as_double();
-  double Kd_null   = g_ros_node->get_parameter("null_Kd").as_double();
   double Kq_posture = g_ros_node->get_parameter("Kq_posture").as_double();
-  double Dq_posture = g_ros_node->get_parameter("Dq_posture").as_double();
   double replay_Kp = g_ros_node->get_parameter("replay_Kp").as_double();
   double replay_Kd = g_ros_node->get_parameter("replay_Kd").as_double();
-  double ilc_Lp = g_ros_node->get_parameter("ilc_Lp").as_double();
-  double ilc_Ld = g_ros_node->get_parameter("ilc_Ld").as_double();
-  double ilc_learning_rate = g_ros_node->get_parameter("ilc_learning_rate").as_double();
-  double ilc_max_delta_qdd = g_ros_node->get_parameter("ilc_max_delta_qdd").as_double();
-  double ilc_max_qdd_ff = g_ros_node->get_parameter("ilc_max_qdd_ff").as_double();
   double max_desired_qdd = g_ros_node->get_parameter("max_desired_qdd").as_double();
-  double m_des     = g_ros_node->get_parameter("m_des").as_double();
 
   double fig8_freq   = g_ros_node->get_parameter("figure8_frequency").as_double();
   double fig8_amp_x  = g_ros_node->get_parameter("figure8_amplitude_x").as_double();
@@ -2055,24 +1673,19 @@ int main(int argc, char** argv)
 
   printf("MJCF:  %s\n", mjcf_path.c_str());
   printf("Pinocchio model source: MJCF\n");
-  printf("Impedance: Kp_task=[%.0f,%.0f,%.0f] Kd_task=[%.0f,%.0f,%.0f] null_Kp=%.1f null_Kd=%.1f Kq_posture=%.1f Dq_posture=%.1f m_des=%.1f\n",
+  printf("Velocity control: Kp_task=[%.2f,%.2f,%.2f] Kq_posture=%.1f\n",
          Kp_task.x(), Kp_task.y(), Kp_task.z(),
-         Kd_task.x(), Kd_task.y(), Kd_task.z(),
-         Kp_null, Kd_null, Kq_posture, Dq_posture, m_des);
-  printf("Replay joint tracking: Kp=%.1f Kd=%.1f max_desired_qdd=%.2f\n",
+         Kq_posture);
+  printf("Replay velocity tracking: Kp=%.2f Kd=%.2f max_desired_qdd=%.2f\n",
          replay_Kp, replay_Kd, max_desired_qdd);
-  printf("ILC: Lp=%.2f Ld=%.2f learning_rate=%.2f max_delta_qdd=%.2f max_qdd_ff=%.2f\n",
-         ilc_Lp, ilc_Ld, ilc_learning_rate, ilc_max_delta_qdd, ilc_max_qdd_ff);
   printf("Figure-8: freq=%.2f Hz  amp_first=%.2f m  amp_second=%.2f m  plane=%s\n",
          fig8_freq, fig8_amp_x, fig8_amp_z, fig8_plane.c_str());
 
-  // --- Create impedance controller ---
+  // --- Create velocity controller ---
   g_ctrl = std::make_unique<ImpedanceController>(
-      mjcf_path, Kp_task, Kd_task, Kp_null, Kd_null, Kq_posture, Dq_posture,
+      mjcf_path, Kp_task, Kq_posture,
       replay_Kp, replay_Kd,
-      ilc_Lp, ilc_Ld, ilc_learning_rate, ilc_max_delta_qdd, ilc_max_qdd_ff,
       max_desired_qdd,
-      m_des,
       "left_tool", "right_tool",
       fig8_freq, fig8_amp_x, fig8_amp_z, fig8_plane);
 
@@ -2083,8 +1696,8 @@ int main(int argc, char** argv)
       "~/joint_actual", rclcpp::QoS(10).reliable());
   g_joint_desired_pub = g_ros_node->create_publisher<sensor_msgs::msg::JointState>(
       "~/joint_desired", rclcpp::QoS(10).reliable());
-  g_left_joint_torque_pub = g_ros_node->create_publisher<sensor_msgs::msg::JointState>(
-      "~/left_joint_torque", rclcpp::QoS(10).reliable());
+  g_left_joint_velocity_cmd_pub = g_ros_node->create_publisher<sensor_msgs::msg::JointState>(
+      "~/left_joint_velocity_cmd", rclcpp::QoS(10).reliable());
   g_joint_actual_kinematics_pub = g_ros_node->create_publisher<std_msgs::msg::Float64MultiArray>(
       "~/joint_actual_kinematics", rclcpp::QoS(10).reliable());
   g_joint_desired_kinematics_pub = g_ros_node->create_publisher<std_msgs::msg::Float64MultiArray>(

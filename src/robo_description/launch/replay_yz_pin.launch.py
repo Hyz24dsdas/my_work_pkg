@@ -14,6 +14,7 @@ Topics published (subscribe in PlotJuggler):
   /joint_states                          — actual joint positions/velocities
   /replay_yz_pin_node/joint_actual          — actual joint positions/velocities
   /replay_yz_pin_node/joint_desired         — desired joint positions/velocities
+  /replay_yz_pin_node/left_joint_torque     — applied left-arm joint torques in JointState.effort
   /replay_yz_pin_node/joint_actual_kinematics   — [q, qd, qdd] per joint
   /replay_yz_pin_node/joint_desired_kinematics  — [q_des, qd_des, qdd_des] per joint
 
